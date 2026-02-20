@@ -18,7 +18,9 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
-func setupAPI(t *testing.T) (*httptest.Server, *store.DB) {
+// setupAPI creates a test server and returns it along with the DB and a
+// registered client identity that can be used to sign authenticated requests.
+func setupAPI(t *testing.T) (*httptest.Server, *store.DB, *identity.Identity) {
 	t.Helper()
 	db, err := store.Open(":memory:", testLogger())
 	if err != nil {
@@ -27,11 +29,68 @@ func setupAPI(t *testing.T) (*httptest.Server, *store.DB) {
 	id, _ := identity.Generate()
 	srv := New("127.0.0.1:0", db, id, testLogger())
 	ts := httptest.NewServer(srv.Handler())
+
+	// Create a client identity and register it
+	clientID, _ := identity.Generate()
+	body, _ := json.Marshal(map[string]string{
+		"public_key":   clientID.PublicKeyHex(),
+		"display_name": "TestClient",
+		"role":         "admin",
+	})
+	resp, err := ts.Client().Post(ts.URL+"/api/v1/users", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("register test client: %v", err)
+	}
+	resp.Body.Close()
+
 	t.Cleanup(func() {
 		ts.Close()
 		db.Close()
 	})
-	return ts, db
+	return ts, db, clientID
+}
+
+// authGet performs an authenticated GET request.
+func authGet(t *testing.T, ts *httptest.Server, clientID *identity.Identity, path string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest("GET", ts.URL+path, nil)
+	signRequest(req, clientID)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("authGet %s: %v", path, err)
+	}
+	return resp
+}
+
+// authPost performs an authenticated POST request.
+func authPost(t *testing.T, ts *httptest.Server, clientID *identity.Identity, path string, body []byte) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest("POST", ts.URL+path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	signRequest(req, clientID)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("authPost %s: %v", path, err)
+	}
+	return resp
+}
+
+// authReq performs an authenticated request with arbitrary method.
+func authReq(t *testing.T, ts *httptest.Server, clientID *identity.Identity, method, path string, body []byte) *http.Response {
+	t.Helper()
+	var req *http.Request
+	if body != nil {
+		req, _ = http.NewRequest(method, ts.URL+path, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+	} else {
+		req, _ = http.NewRequest(method, ts.URL+path, nil)
+	}
+	signRequest(req, clientID)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("authReq %s %s: %v", method, path, err)
+	}
+	return resp
 }
 
 func createTestUser(t *testing.T, ts *httptest.Server, pubKey, name string) int64 {
@@ -55,7 +114,7 @@ func createTestUser(t *testing.T, ts *httptest.Server, pubKey, name string) int6
 }
 
 func TestHealthEndpoint(t *testing.T) {
-	ts, _ := setupAPI(t)
+	ts, _, _ := setupAPI(t)
 
 	resp, err := ts.Client().Get(ts.URL + "/api/v1/health")
 	if err != nil {
@@ -75,7 +134,7 @@ func TestHealthEndpoint(t *testing.T) {
 }
 
 func TestIdentityEndpoint(t *testing.T) {
-	ts, _ := setupAPI(t)
+	ts, _, _ := setupAPI(t)
 
 	resp, err := ts.Client().Get(ts.URL + "/api/v1/identity")
 	if err != nil {
@@ -97,7 +156,7 @@ func TestIdentityEndpoint(t *testing.T) {
 }
 
 func TestICEServersEndpoint(t *testing.T) {
-	ts, _ := setupAPI(t)
+	ts, _, _ := setupAPI(t)
 
 	resp, err := ts.Client().Get(ts.URL + "/api/v1/ice-servers")
 	if err != nil {
@@ -115,16 +174,16 @@ func TestICEServersEndpoint(t *testing.T) {
 }
 
 func TestUserCRUD(t *testing.T) {
-	ts, _ := setupAPI(t)
+	ts, _, clientID := setupAPI(t)
 
-	// Create
+	// Create (public endpoint)
 	id := createTestUser(t, ts, "aabbccdd11223344", "Alice")
 	if id == 0 {
 		t.Fatal("expected non-zero user id")
 	}
 
-	// Get
-	resp, _ := ts.Client().Get(fmt.Sprintf("%s/api/v1/users/%d", ts.URL, id))
+	// Get (authenticated)
+	resp := authGet(t, ts, clientID, fmt.Sprintf("/api/v1/users/%d", id))
 	defer resp.Body.Close()
 	var user map[string]any
 	json.NewDecoder(resp.Body).Decode(&user)
@@ -132,36 +191,33 @@ func TestUserCRUD(t *testing.T) {
 		t.Errorf("display_name: got %v, want Alice", user["display_name"])
 	}
 
-	// List
-	resp2, _ := ts.Client().Get(ts.URL + "/api/v1/users")
+	// List (authenticated)
+	resp2 := authGet(t, ts, clientID, "/api/v1/users")
 	defer resp2.Body.Close()
 	var list map[string]any
 	json.NewDecoder(resp2.Body).Decode(&list)
 	users := list["users"].([]any)
-	if len(users) != 1 {
-		t.Errorf("user count: got %d, want 1", len(users))
+	if len(users) < 1 {
+		t.Errorf("user count: got %d, want at least 1", len(users))
 	}
 
-	// Update
+	// Update (authenticated)
 	updateBody, _ := json.Marshal(map[string]string{"display_name": "Alice Updated"})
-	req, _ := http.NewRequest("PUT", fmt.Sprintf("%s/api/v1/users/%d", ts.URL, id), bytes.NewReader(updateBody))
-	req.Header.Set("Content-Type", "application/json")
-	resp3, _ := ts.Client().Do(req)
+	resp3 := authReq(t, ts, clientID, "PUT", fmt.Sprintf("/api/v1/users/%d", id), updateBody)
 	defer resp3.Body.Close()
 	if resp3.StatusCode != 200 {
 		t.Errorf("update status: got %d, want 200", resp3.StatusCode)
 	}
 
-	// Delete
-	delReq, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/users/%d", ts.URL, id), nil)
-	resp4, _ := ts.Client().Do(delReq)
+	// Delete (authenticated)
+	resp4 := authReq(t, ts, clientID, "DELETE", fmt.Sprintf("/api/v1/users/%d", id), nil)
 	defer resp4.Body.Close()
 	if resp4.StatusCode != 200 {
 		t.Errorf("delete status: got %d, want 200", resp4.StatusCode)
 	}
 
-	// Verify deleted
-	resp5, _ := ts.Client().Get(fmt.Sprintf("%s/api/v1/users/%d", ts.URL, id))
+	// Verify deleted (authenticated)
+	resp5 := authGet(t, ts, clientID, fmt.Sprintf("/api/v1/users/%d", id))
 	defer resp5.Body.Close()
 	if resp5.StatusCode != 404 {
 		t.Errorf("get deleted user status: got %d, want 404", resp5.StatusCode)
@@ -169,7 +225,7 @@ func TestUserCRUD(t *testing.T) {
 }
 
 func TestDuplicateUserKey(t *testing.T) {
-	ts, _ := setupAPI(t)
+	ts, _, _ := setupAPI(t)
 
 	createTestUser(t, ts, "duplicate_key_1234", "First")
 
@@ -186,11 +242,11 @@ func TestDuplicateUserKey(t *testing.T) {
 }
 
 func TestDeviceRegistration(t *testing.T) {
-	ts, _ := setupAPI(t)
+	ts, _, clientID := setupAPI(t)
 
 	userID := createTestUser(t, ts, "device_test_user_key", "DeviceUser")
 
-	// Register device
+	// Register device (authenticated)
 	devBody, _ := json.Marshal(map[string]any{
 		"user_id":     userID,
 		"device_key":  "device_aabb_ccdd",
@@ -199,14 +255,14 @@ func TestDeviceRegistration(t *testing.T) {
 		"push_token":  "apns_token_123",
 		"push_type":   "apns",
 	})
-	resp, _ := ts.Client().Post(ts.URL+"/api/v1/devices", "application/json", bytes.NewReader(devBody))
+	resp := authPost(t, ts, clientID, "/api/v1/devices", devBody)
 	defer resp.Body.Close()
 	if resp.StatusCode != 201 {
 		t.Fatalf("register device status: got %d, want 201", resp.StatusCode)
 	}
 
-	// List devices
-	resp2, _ := ts.Client().Get(fmt.Sprintf("%s/api/v1/users/%d/devices", ts.URL, userID))
+	// List devices (authenticated)
+	resp2 := authGet(t, ts, clientID, fmt.Sprintf("/api/v1/users/%d/devices", userID))
 	defer resp2.Body.Close()
 	var result map[string]any
 	json.NewDecoder(resp2.Body).Decode(&result)
@@ -222,11 +278,11 @@ func TestDeviceRegistration(t *testing.T) {
 		"device_name": "iPhone 15 Pro",
 		"platform":    "ios",
 	})
-	resp3, _ := ts.Client().Post(ts.URL+"/api/v1/devices", "application/json", bytes.NewReader(devBody2))
+	resp3 := authPost(t, ts, clientID, "/api/v1/devices", devBody2)
 	defer resp3.Body.Close()
 
 	// Should still be 1 device
-	resp4, _ := ts.Client().Get(fmt.Sprintf("%s/api/v1/users/%d/devices", ts.URL, userID))
+	resp4 := authGet(t, ts, clientID, fmt.Sprintf("/api/v1/users/%d/devices", userID))
 	defer resp4.Body.Close()
 	var result2 map[string]any
 	json.NewDecoder(resp4.Body).Decode(&result2)
@@ -237,21 +293,21 @@ func TestDeviceRegistration(t *testing.T) {
 }
 
 func TestMessageFlow(t *testing.T) {
-	ts, _ := setupAPI(t)
+	ts, _, clientID := setupAPI(t)
 
 	senderKey := "sender_key_aabbccdd"
 	recipientKey := "recipient_key_11223344"
 	createTestUser(t, ts, senderKey, "Sender")
 	createTestUser(t, ts, recipientKey, "Recipient")
 
-	// Send message
+	// Send message (authenticated)
 	msgBody, _ := json.Marshal(map[string]string{
 		"sender_key":    senderKey,
 		"recipient_key": recipientKey,
 		"content":       "encrypted_message_data",
 		"content_type":  "text",
 	})
-	resp, _ := ts.Client().Post(ts.URL+"/api/v1/messages", "application/json", bytes.NewReader(msgBody))
+	resp := authPost(t, ts, clientID, "/api/v1/messages", msgBody)
 	defer resp.Body.Close()
 	if resp.StatusCode != 201 {
 		t.Fatalf("send message status: got %d, want 201", resp.StatusCode)
@@ -260,8 +316,8 @@ func TestMessageFlow(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&sendResult)
 	msgID := int64(sendResult["id"].(float64))
 
-	// Get pending messages for recipient
-	resp2, _ := ts.Client().Get(fmt.Sprintf("%s/api/v1/messages/%s", ts.URL, recipientKey))
+	// Get pending messages (authenticated)
+	resp2 := authGet(t, ts, clientID, fmt.Sprintf("/api/v1/messages/%s", recipientKey))
 	defer resp2.Body.Close()
 	var msgResult map[string]any
 	json.NewDecoder(resp2.Body).Decode(&msgResult)
@@ -274,16 +330,15 @@ func TestMessageFlow(t *testing.T) {
 		t.Errorf("sender_key: got %v, want %s", msg["sender_key"], senderKey)
 	}
 
-	// Mark delivered
-	req, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/messages/%d/delivered", ts.URL, msgID), nil)
-	resp3, _ := ts.Client().Do(req)
+	// Mark delivered (authenticated)
+	resp3 := authPost(t, ts, clientID, fmt.Sprintf("/api/v1/messages/%d/delivered", msgID), nil)
 	defer resp3.Body.Close()
 	if resp3.StatusCode != 200 {
 		t.Errorf("mark delivered status: got %d, want 200", resp3.StatusCode)
 	}
 
 	// Pending messages should be empty now
-	resp4, _ := ts.Client().Get(fmt.Sprintf("%s/api/v1/messages/%s", ts.URL, recipientKey))
+	resp4 := authGet(t, ts, clientID, fmt.Sprintf("/api/v1/messages/%s", recipientKey))
 	defer resp4.Body.Close()
 	var emptyResult map[string]any
 	json.NewDecoder(resp4.Body).Decode(&emptyResult)
@@ -294,14 +349,14 @@ func TestMessageFlow(t *testing.T) {
 }
 
 func TestMessageToUnknownRecipient(t *testing.T) {
-	ts, _ := setupAPI(t)
+	ts, _, clientID := setupAPI(t)
 
 	msgBody, _ := json.Marshal(map[string]string{
 		"sender_key":    "some_sender",
 		"recipient_key": "nonexistent_key",
 		"content":       "hello",
 	})
-	resp, _ := ts.Client().Post(ts.URL+"/api/v1/messages", "application/json", bytes.NewReader(msgBody))
+	resp := authPost(t, ts, clientID, "/api/v1/messages", msgBody)
 	defer resp.Body.Close()
 	if resp.StatusCode != 404 {
 		t.Errorf("message to unknown recipient: got %d, want 404", resp.StatusCode)
@@ -309,17 +364,17 @@ func TestMessageToUnknownRecipient(t *testing.T) {
 }
 
 func TestContactsCRUD(t *testing.T) {
-	ts, _ := setupAPI(t)
+	ts, _, clientID := setupAPI(t)
 
 	userID := createTestUser(t, ts, "contacts_user_key", "ContactUser")
 
-	// Add contact
+	// Add contact (authenticated)
 	contactBody, _ := json.Marshal(map[string]any{
 		"user_id":      userID,
 		"contact_key":  "friend_key_1234",
 		"display_name": "My Friend",
 	})
-	resp, _ := ts.Client().Post(ts.URL+"/api/v1/contacts", "application/json", bytes.NewReader(contactBody))
+	resp := authPost(t, ts, clientID, "/api/v1/contacts", contactBody)
 	defer resp.Body.Close()
 	if resp.StatusCode != 201 {
 		t.Fatalf("add contact status: got %d, want 201", resp.StatusCode)
@@ -328,8 +383,8 @@ func TestContactsCRUD(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&addResult)
 	contactID := int64(addResult["id"].(float64))
 
-	// List contacts
-	resp2, _ := ts.Client().Get(fmt.Sprintf("%s/api/v1/users/%d/contacts", ts.URL, userID))
+	// List contacts (authenticated)
+	resp2 := authGet(t, ts, clientID, fmt.Sprintf("/api/v1/users/%d/contacts", userID))
 	defer resp2.Body.Close()
 	var listResult map[string]any
 	json.NewDecoder(resp2.Body).Decode(&listResult)
@@ -338,19 +393,16 @@ func TestContactsCRUD(t *testing.T) {
 		t.Errorf("contact count: got %d, want 1", len(contacts))
 	}
 
-	// Block contact
+	// Block contact (authenticated)
 	blockBody, _ := json.Marshal(map[string]bool{"blocked": true})
-	blockReq, _ := http.NewRequest("PUT", fmt.Sprintf("%s/api/v1/contacts/%d/block", ts.URL, contactID), bytes.NewReader(blockBody))
-	blockReq.Header.Set("Content-Type", "application/json")
-	resp3, _ := ts.Client().Do(blockReq)
+	resp3 := authReq(t, ts, clientID, "PUT", fmt.Sprintf("/api/v1/contacts/%d/block", contactID), blockBody)
 	defer resp3.Body.Close()
 	if resp3.StatusCode != 200 {
 		t.Errorf("block contact status: got %d, want 200", resp3.StatusCode)
 	}
 
-	// Delete contact
-	delReq, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/contacts/%d", ts.URL, contactID), nil)
-	resp4, _ := ts.Client().Do(delReq)
+	// Delete contact (authenticated)
+	resp4 := authReq(t, ts, clientID, "DELETE", fmt.Sprintf("/api/v1/contacts/%d", contactID), nil)
 	defer resp4.Body.Close()
 	if resp4.StatusCode != 200 {
 		t.Errorf("delete contact status: got %d, want 200", resp4.StatusCode)
@@ -358,7 +410,7 @@ func TestContactsCRUD(t *testing.T) {
 }
 
 func TestCallLogEndpoint(t *testing.T) {
-	ts, db := setupAPI(t)
+	ts, db, clientID := setupAPI(t)
 
 	userID := createTestUser(t, ts, "calls_user_key", "CallUser")
 
@@ -369,7 +421,7 @@ func TestCallLogEndpoint(t *testing.T) {
 		userID,
 	)
 
-	resp, _ := ts.Client().Get(fmt.Sprintf("%s/api/v1/users/%d/calls", ts.URL, userID))
+	resp := authGet(t, ts, clientID, fmt.Sprintf("/api/v1/users/%d/calls", userID))
 	defer resp.Body.Close()
 	var result map[string]any
 	json.NewDecoder(resp.Body).Decode(&result)
@@ -387,11 +439,11 @@ func TestCallLogEndpoint(t *testing.T) {
 }
 
 func TestRoutingRulesCRUD(t *testing.T) {
-	ts, _ := setupAPI(t)
+	ts, _, clientID := setupAPI(t)
 
 	userID := createTestUser(t, ts, "routing_user_key", "RoutingUser")
 
-	// Create rule
+	// Create rule (authenticated)
 	ruleBody, _ := json.Marshal(map[string]any{
 		"user_id":    userID,
 		"priority":   10,
@@ -399,7 +451,7 @@ func TestRoutingRulesCRUD(t *testing.T) {
 		"conditions": `{"caller_group": "family"}`,
 		"action":     "ring",
 	})
-	resp, _ := ts.Client().Post(ts.URL+"/api/v1/routing", "application/json", bytes.NewReader(ruleBody))
+	resp := authPost(t, ts, clientID, "/api/v1/routing", ruleBody)
 	defer resp.Body.Close()
 	if resp.StatusCode != 201 {
 		t.Fatalf("create rule status: got %d, want 201", resp.StatusCode)
@@ -408,8 +460,8 @@ func TestRoutingRulesCRUD(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&createResult)
 	ruleID := int64(createResult["id"].(float64))
 
-	// List rules
-	resp2, _ := ts.Client().Get(fmt.Sprintf("%s/api/v1/users/%d/routing", ts.URL, userID))
+	// List rules (authenticated)
+	resp2 := authGet(t, ts, clientID, fmt.Sprintf("/api/v1/users/%d/routing", userID))
 	defer resp2.Body.Close()
 	var listResult map[string]any
 	json.NewDecoder(resp2.Body).Decode(&listResult)
@@ -418,19 +470,16 @@ func TestRoutingRulesCRUD(t *testing.T) {
 		t.Errorf("rule count: got %d, want 1", len(rules))
 	}
 
-	// Update rule
+	// Update rule (authenticated)
 	updateBody, _ := json.Marshal(map[string]any{"name": "Updated Rule", "priority": 5})
-	updateReq, _ := http.NewRequest("PUT", fmt.Sprintf("%s/api/v1/routing/%d", ts.URL, ruleID), bytes.NewReader(updateBody))
-	updateReq.Header.Set("Content-Type", "application/json")
-	resp3, _ := ts.Client().Do(updateReq)
+	resp3 := authReq(t, ts, clientID, "PUT", fmt.Sprintf("/api/v1/routing/%d", ruleID), updateBody)
 	defer resp3.Body.Close()
 	if resp3.StatusCode != 200 {
 		t.Errorf("update rule status: got %d, want 200", resp3.StatusCode)
 	}
 
-	// Delete rule
-	delReq, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/routing/%d", ts.URL, ruleID), nil)
-	resp4, _ := ts.Client().Do(delReq)
+	// Delete rule (authenticated)
+	resp4 := authReq(t, ts, clientID, "DELETE", fmt.Sprintf("/api/v1/routing/%d", ruleID), nil)
 	defer resp4.Body.Close()
 	if resp4.StatusCode != 200 {
 		t.Errorf("delete rule status: got %d, want 200", resp4.StatusCode)
@@ -438,13 +487,13 @@ func TestRoutingRulesCRUD(t *testing.T) {
 }
 
 func TestConfigEndpoint(t *testing.T) {
-	ts, db := setupAPI(t)
+	ts, db, clientID := setupAPI(t)
 
 	// Insert some config
 	db.Exec("INSERT INTO server_config (key, value) VALUES ('turn_url', 'turn:example.com:3478')")
 	db.Exec("INSERT INTO server_config (key, value) VALUES ('version', '0.1.0')")
 
-	resp, _ := ts.Client().Get(ts.URL + "/api/v1/config")
+	resp := authGet(t, ts, clientID, "/api/v1/config")
 	defer resp.Body.Close()
 	var result map[string]any
 	json.NewDecoder(resp.Body).Decode(&result)
@@ -458,13 +507,14 @@ func TestConfigEndpoint(t *testing.T) {
 }
 
 func TestICEServersWithTURN(t *testing.T) {
-	ts, db := setupAPI(t)
+	ts, db, _ := setupAPI(t)
 
 	// Configure a TURN server
 	db.Exec("INSERT INTO server_config (key, value) VALUES ('turn_url', 'turn:my.turn.server:3478')")
 	db.Exec("INSERT INTO server_config (key, value) VALUES ('turn_username', 'myuser')")
 	db.Exec("INSERT INTO server_config (key, value) VALUES ('turn_credential', 'mysecret')")
 
+	// ICE servers is a public endpoint
 	resp, _ := ts.Client().Get(ts.URL + "/api/v1/ice-servers")
 	defer resp.Body.Close()
 	var result map[string]any

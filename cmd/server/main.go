@@ -6,7 +6,10 @@ import (
 	"log"
 	"os"
 
+	"time"
+
 	"github.com/Parsons-ai/comms-server/internal/api"
+	"github.com/Parsons-ai/comms-server/internal/cleanup"
 	"github.com/Parsons-ai/comms-server/internal/config"
 	"github.com/Parsons-ai/comms-server/internal/dashboard"
 	"github.com/Parsons-ai/comms-server/internal/server"
@@ -127,8 +130,9 @@ func runServer() {
 		app.Register(sipBridge)
 	}
 
-	// TODO: AI triage service (optional)
-	// if cfg.TriageEnabled { app.Register(triage.New(...)) }
+	// 5. Cleanup service (message expiry, storage tracking)
+	cleanupSvc := cleanup.New(app.DB, 5*time.Minute, app.Logger)
+	app.Register(cleanupSvc)
 
 	fmt.Printf("COMMS Server v%s\n", version)
 	fmt.Printf("Public Key: %s\n", app.Identity.PublicKeyHex())

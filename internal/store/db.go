@@ -72,6 +72,7 @@ const schema = `
 CREATE TABLE IF NOT EXISTS users (
     id          INTEGER PRIMARY KEY,
     public_key  TEXT NOT NULL UNIQUE,  -- hex-encoded Ed25519 public key
+    x25519_key  TEXT,                  -- hex-encoded X25519 public key for E2E encryption
     display_name TEXT NOT NULL DEFAULT '',
     role        TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user', 'managed')),
     status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'inactive')),

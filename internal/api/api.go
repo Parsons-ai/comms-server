@@ -10,6 +10,7 @@ import (
 
 	"github.com/Parsons-ai/comms-server/internal/identity"
 	"github.com/Parsons-ai/comms-server/internal/store"
+	"github.com/Parsons-ai/comms-server/internal/triage"
 )
 
 // Server is the REST API server for the mobile app.
@@ -17,6 +18,7 @@ type Server struct {
 	logger   *slog.Logger
 	db       *store.DB
 	identity *identity.Identity
+	triage   *triage.Engine
 	mux      *http.ServeMux
 	srv      *http.Server
 	addr     string
@@ -28,6 +30,7 @@ func New(addr string, db *store.DB, id *identity.Identity, logger *slog.Logger) 
 		logger:   logger.With("service", "api"),
 		db:       db,
 		identity: id,
+		triage:   triage.New(db, logger),
 		addr:     addr,
 	}
 
@@ -36,7 +39,7 @@ func New(addr string, db *store.DB, id *identity.Identity, logger *slog.Logger) 
 
 	s.srv = &http.Server{
 		Addr:         addr,
-		Handler:      s.mux,
+		Handler:      s.authMiddleware(s.mux),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -85,6 +88,15 @@ func (s *Server) routes() {
 
 	// Server config
 	s.mux.HandleFunc("GET /api/v1/config", s.handleGetConfig)
+
+	// AI Triage
+	s.mux.HandleFunc("GET /api/v1/users/{id}/ai-config", s.handleGetAIConfig)
+	s.mux.HandleFunc("PUT /api/v1/users/{id}/ai-config", s.handleSetAIConfig)
+	s.mux.HandleFunc("POST /api/v1/triage/evaluate", s.handleTriageEvaluate)
+	s.mux.HandleFunc("GET /api/v1/users/{id}/ai-conversations", s.handleListAIConversations)
+
+	// Crypto key exchange
+	s.mux.HandleFunc("GET /api/v1/users/{id}/x25519-key", s.handleGetX25519Key)
 }
 
 // Name implements Service.
@@ -111,9 +123,9 @@ func (s *Server) Health() error {
 	return s.db.Ping()
 }
 
-// Handler returns the HTTP handler for testing.
+// Handler returns the HTTP handler (with auth middleware) for testing.
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return s.authMiddleware(s.mux)
 }
 
 // --- Health & Identity ---
@@ -198,6 +210,7 @@ func (s *Server) handleListUsers(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PublicKey   string `json:"public_key"`
+		X25519Key  string `json:"x25519_key"`
 		DisplayName string `json:"display_name"`
 		Role        string `json:"role"`
 	}
@@ -214,8 +227,8 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := s.db.Exec(
-		"INSERT INTO users (public_key, display_name, role) VALUES (?, ?, ?)",
-		req.PublicKey, req.DisplayName, req.Role,
+		"INSERT INTO users (public_key, x25519_key, display_name, role) VALUES (?, ?, ?, ?)",
+		req.PublicKey, nilIfEmpty(req.X25519Key), req.DisplayName, req.Role,
 	)
 	if err != nil {
 		s.json(w, http.StatusConflict, map[string]string{"error": "create user: " + err.Error()})
@@ -829,4 +842,103 @@ func nilIfEmpty(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// --- AI Triage ---
+
+func (s *Server) handleGetAIConfig(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("id")
+	var uid int64
+	fmt.Sscanf(userID, "%d", &uid)
+
+	config, err := s.triage.GetConfig(uid)
+	if err != nil {
+		s.json(w, http.StatusNotFound, map[string]string{"error": "no AI config found"})
+		return
+	}
+	s.json(w, http.StatusOK, config)
+}
+
+func (s *Server) handleSetAIConfig(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("id")
+	var uid int64
+	fmt.Sscanf(userID, "%d", &uid)
+
+	var config triage.UserConfig
+	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
+		s.clientError(w, "invalid request body")
+		return
+	}
+	if err := s.triage.SetConfig(uid, config); err != nil {
+		s.serverError(w, "set AI config", err)
+		return
+	}
+	s.json(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+func (s *Server) handleTriageEvaluate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UserID int64              `json:"user_id"`
+		Caller triage.CallerInfo  `json:"caller"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.clientError(w, "invalid request body")
+		return
+	}
+
+	decision, err := s.triage.Evaluate(r.Context(), req.UserID, req.Caller)
+	if err != nil {
+		s.serverError(w, "triage evaluate", err)
+		return
+	}
+	s.json(w, http.StatusOK, decision)
+}
+
+func (s *Server) handleListAIConversations(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("id")
+
+	rows, err := s.db.Query(
+		`SELECT id, call_id, model, started_at, ended_at, outcome
+		 FROM ai_conversations WHERE user_id = ? ORDER BY started_at DESC LIMIT 50`,
+		userID,
+	)
+	if err != nil {
+		s.serverError(w, "query AI conversations", err)
+		return
+	}
+	defer rows.Close()
+
+	type conv struct {
+		ID        int64   `json:"id"`
+		CallID    *int64  `json:"call_id"`
+		Model     string  `json:"model"`
+		StartedAt string  `json:"started_at"`
+		EndedAt   *string `json:"ended_at"`
+		Outcome   *string `json:"outcome"`
+	}
+
+	var convs []conv
+	for rows.Next() {
+		var c conv
+		rows.Scan(&c.ID, &c.CallID, &c.Model, &c.StartedAt, &c.EndedAt, &c.Outcome)
+		convs = append(convs, c)
+	}
+	if convs == nil {
+		convs = []conv{}
+	}
+	s.json(w, http.StatusOK, map[string]any{"conversations": convs})
+}
+
+// --- Crypto Key Exchange ---
+
+func (s *Server) handleGetX25519Key(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("id")
+
+	var x25519Key *string
+	err := s.db.QueryRow("SELECT x25519_key FROM users WHERE id = ?", userID).Scan(&x25519Key)
+	if err != nil || x25519Key == nil {
+		s.json(w, http.StatusNotFound, map[string]string{"error": "X25519 key not found"})
+		return
+	}
+	s.json(w, http.StatusOK, map[string]string{"x25519_public_key": *x25519Key})
 }
