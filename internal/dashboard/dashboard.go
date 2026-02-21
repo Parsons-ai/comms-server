@@ -321,18 +321,16 @@ const dashboardHTML = `<!DOCTYPE html>
                 <dd>{{.Platform}} ({{.GoVersion}})</dd>
             </dl>
         </div>
-        {{if .QRDataURI}}
         <div class="card">
             <h2>Connect Device</h2>
             <div class="qr-section">
-                <img src="{{.QRDataURI}}" alt="QR Code" class="qr-code" />
+                <img src="/dashboard/api/qr" alt="QR Code" class="qr-code" />
                 <div class="qr-info">
                     <p>Scan with the COMMS app to connect</p>
                     <code class="connect-uri">http://{{.LocalIP}}:8080</code>
                 </div>
             </div>
         </div>
-        {{end}}
         <div class="card">
             <h2>Statistics</h2>
             <div class="stats-grid">
