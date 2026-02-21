@@ -109,7 +109,7 @@ func runServer() {
 	app.Register(apiServer)
 
 	// 3. Dashboard (mounted on API server's mux)
-	dash := dashboard.New(app.DB, app.Identity, version, app.Logger)
+	dash := dashboard.New(app.DB, app.Identity, version, fmt.Sprintf("%d", cfg.APIPort), app.Logger)
 	dash.Mount(apiServer.Mux())
 
 	// 4. SIP/VoIP bridge (optional, for legacy phone integration)

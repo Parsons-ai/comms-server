@@ -1,13 +1,17 @@
 package dashboard
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/http"
 	"runtime"
 	"time"
+
+	qrcode "github.com/skip2/go-qrcode"
 
 	"github.com/Parsons-ai/comms-server/internal/identity"
 	"github.com/Parsons-ai/comms-server/internal/store"
@@ -21,21 +25,24 @@ type Server struct {
 	mux      *http.ServeMux
 	started  time.Time
 	version  string
+	apiPort  string
 }
 
 // New creates a new dashboard.
-func New(db *store.DB, id *identity.Identity, version string, logger *slog.Logger) *Server {
+func New(db *store.DB, id *identity.Identity, version string, apiPort string, logger *slog.Logger) *Server {
 	s := &Server{
 		logger:   logger.With("service", "dashboard"),
 		db:       db,
 		identity: id,
 		started:  time.Now(),
 		version:  version,
+		apiPort:  apiPort,
 	}
 
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("GET /dashboard", s.handleDashboard)
 	s.mux.HandleFunc("GET /dashboard/api/status", s.handleAPIStatus)
+	s.mux.HandleFunc("GET /dashboard/api/qr", s.handleQRCode)
 
 	return s
 }
@@ -44,6 +51,7 @@ func New(db *store.DB, id *identity.Identity, version string, logger *slog.Logge
 func (s *Server) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
 	mux.HandleFunc("GET /dashboard/api/status", s.handleAPIStatus)
+	mux.HandleFunc("GET /dashboard/api/qr", s.handleQRCode)
 }
 
 // Handler returns the HTTP handler for testing.
@@ -66,16 +74,47 @@ type statusData struct {
 	CallCount    int `json:"total_calls"`
 	ContactCount int `json:"contact_count"`
 	RuleCount    int `json:"routing_rules"`
+
+	ConnectURI string `json:"connect_uri"`
+	LocalIP    string `json:"local_ip"`
+	QRDataURI  string `json:"-"` // only for HTML template, not JSON
+}
+
+// localIP returns the preferred outbound local IP address.
+func localIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		// Fallback: scan interfaces
+		addrs, _ := net.InterfaceAddrs()
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+		return "localhost"
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
+func (s *Server) connectURI() string {
+	ip := localIP()
+	return fmt.Sprintf("comms://connect?host=%s:%s&key=%s", ip, s.apiPort, s.identity.PublicKeyHex())
 }
 
 func (s *Server) getStatus() statusData {
+	ip := localIP()
+	uri := fmt.Sprintf("comms://connect?host=%s:%s&key=%s", ip, s.apiPort, s.identity.PublicKeyHex())
+
 	data := statusData{
-		Version:   s.version,
-		PublicKey: s.identity.PublicKeyHex(),
-		ShortID:   s.identity.ShortID(),
-		Uptime:    time.Since(s.started).Round(time.Second).String(),
-		GoVersion: runtime.Version(),
-		Platform:  runtime.GOOS + "/" + runtime.GOARCH,
+		Version:    s.version,
+		PublicKey:  s.identity.PublicKeyHex(),
+		ShortID:    s.identity.ShortID(),
+		Uptime:     time.Since(s.started).Round(time.Second).String(),
+		GoVersion:  runtime.Version(),
+		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
+		ConnectURI: uri,
+		LocalIP:    ip,
 	}
 
 	s.db.QueryRow("SELECT count(*) FROM users").Scan(&data.UserCount)
@@ -85,12 +124,30 @@ func (s *Server) getStatus() statusData {
 	s.db.QueryRow("SELECT count(*) FROM contacts").Scan(&data.ContactCount)
 	s.db.QueryRow("SELECT count(*) FROM routing_rules").Scan(&data.RuleCount)
 
+	// Generate QR code as base64 data URI for the template
+	png, err := qrcode.Encode(uri, qrcode.Medium, 256)
+	if err == nil {
+		data.QRDataURI = "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+	}
+
 	return data
 }
 
 func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(s.getStatus())
+}
+
+func (s *Server) handleQRCode(w http.ResponseWriter, r *http.Request) {
+	uri := s.connectURI()
+	png, err := qrcode.Encode(uri, qrcode.Medium, 512)
+	if err != nil {
+		http.Error(w, "qr generation failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Write(png)
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -198,6 +255,40 @@ const dashboardHTML = `<!DOCTYPE html>
             color: #666;
             margin-top: 0.25rem;
         }
+        .qr-section {
+            display: flex;
+            align-items: center;
+            gap: 1.5rem;
+            padding: 1.5rem;
+        }
+        .qr-code {
+            width: 180px;
+            height: 180px;
+            border-radius: 0.5rem;
+            background: #fff;
+            padding: 8px;
+        }
+        .qr-info {
+            flex: 1;
+        }
+        .qr-info p {
+            color: #888;
+            font-size: 0.875rem;
+            margin-bottom: 0.75rem;
+        }
+        .connect-uri {
+            display: block;
+            background: #0a0a0a;
+            border: 1px solid #1a1a1a;
+            border-radius: 0.375rem;
+            padding: 0.5rem 0.75rem;
+            font-size: 0.8rem;
+            color: #4ade80;
+            word-break: break-all;
+        }
+        @media (max-width: 640px) {
+            .qr-section { flex-direction: column; text-align: center; }
+        }
         .footer {
             text-align: center;
             padding: 2rem;
@@ -230,6 +321,18 @@ const dashboardHTML = `<!DOCTYPE html>
                 <dd>{{.Platform}} ({{.GoVersion}})</dd>
             </dl>
         </div>
+        {{if .QRDataURI}}
+        <div class="card">
+            <h2>Connect Device</h2>
+            <div class="qr-section">
+                <img src="{{.QRDataURI}}" alt="QR Code" class="qr-code" />
+                <div class="qr-info">
+                    <p>Scan with the COMMS app to connect</p>
+                    <code class="connect-uri">http://{{.LocalIP}}:8080</code>
+                </div>
+            </div>
+        </div>
+        {{end}}
         <div class="card">
             <h2>Statistics</h2>
             <div class="stats-grid">

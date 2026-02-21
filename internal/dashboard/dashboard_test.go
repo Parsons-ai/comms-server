@@ -24,7 +24,7 @@ func setupDashboard(t *testing.T) (*httptest.Server, *store.DB) {
 		t.Fatalf("open db: %v", err)
 	}
 	id, _ := identity.Generate()
-	dash := New(db, id, "0.1.0-test", testLogger())
+	dash := New(db, id, "0.1.0-test", "8080", testLogger())
 	ts := httptest.NewServer(dash.Handler())
 	t.Cleanup(func() {
 		ts.Close()
@@ -91,7 +91,7 @@ func TestDashboardMount(t *testing.T) {
 	defer db.Close()
 
 	id, _ := identity.Generate()
-	dash := New(db, id, "0.1.0", testLogger())
+	dash := New(db, id, "0.1.0", "8080", testLogger())
 
 	mux := http.NewServeMux()
 	dash.Mount(mux)
