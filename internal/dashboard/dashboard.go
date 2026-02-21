@@ -1,7 +1,6 @@
 package dashboard
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -77,7 +76,7 @@ type statusData struct {
 
 	ConnectURI string `json:"connect_uri"`
 	LocalIP    string `json:"local_ip"`
-	QRDataURI  string `json:"-"` // only for HTML template, not JSON
+	APIPort    string `json:"api_port"`
 }
 
 // localIP returns the preferred outbound local IP address.
@@ -104,7 +103,6 @@ func (s *Server) connectURI() string {
 
 func (s *Server) getStatus() statusData {
 	ip := localIP()
-	uri := fmt.Sprintf("comms://connect?host=%s:%s&key=%s", ip, s.apiPort, s.identity.PublicKeyHex())
 
 	data := statusData{
 		Version:    s.version,
@@ -113,8 +111,9 @@ func (s *Server) getStatus() statusData {
 		Uptime:     time.Since(s.started).Round(time.Second).String(),
 		GoVersion:  runtime.Version(),
 		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
-		ConnectURI: uri,
+		ConnectURI: s.connectURI(),
 		LocalIP:    ip,
+		APIPort:    s.apiPort,
 	}
 
 	s.db.QueryRow("SELECT count(*) FROM users").Scan(&data.UserCount)
@@ -123,12 +122,6 @@ func (s *Server) getStatus() statusData {
 	s.db.QueryRow("SELECT count(*) FROM call_log").Scan(&data.CallCount)
 	s.db.QueryRow("SELECT count(*) FROM contacts").Scan(&data.ContactCount)
 	s.db.QueryRow("SELECT count(*) FROM routing_rules").Scan(&data.RuleCount)
-
-	// Generate QR code as base64 data URI for the template
-	png, err := qrcode.Encode(uri, qrcode.Medium, 256)
-	if err == nil {
-		data.QRDataURI = "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
-	}
 
 	return data
 }
@@ -259,7 +252,6 @@ const dashboardHTML = `<!DOCTYPE html>
             display: flex;
             align-items: center;
             gap: 1.5rem;
-            padding: 1.5rem;
         }
         .qr-code {
             width: 180px;
@@ -327,7 +319,7 @@ const dashboardHTML = `<!DOCTYPE html>
                 <img src="/dashboard/api/qr" alt="QR Code" class="qr-code" />
                 <div class="qr-info">
                     <p>Scan with the COMMS app to connect</p>
-                    <code class="connect-uri">http://{{.LocalIP}}:8080</code>
+                    <code class="connect-uri">http://{{.LocalIP}}:{{.APIPort}}</code>
                 </div>
             </div>
         </div>
