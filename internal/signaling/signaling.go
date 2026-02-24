@@ -23,7 +23,12 @@ const (
 	MsgTypePong      = "pong"
 	MsgTypeAuth      = "auth"
 	MsgTypeAuthOK    = "auth_ok"
-	MsgTypeError     = "error"
+	MsgTypeError        = "error"
+	MsgTypeIncomingCall  = "incoming_call"
+	MsgTypeIncomingSMS   = "incoming_sms"
+	MsgTypeCallAccept    = "call_accept"
+	MsgTypeCallReject    = "call_reject"
+	MsgTypeDirectMessage = "direct_message"
 )
 
 // Message is the wire format for signaling messages.
@@ -49,12 +54,23 @@ type activeCall struct {
 	dbID      int64
 }
 
+// InternalPeerHandler receives signaling messages for internal (non-WebSocket) peers.
+type InternalPeerHandler func(msg Message)
+
+// internalPeer is a virtual peer that receives messages via callback instead of WebSocket.
+type internalPeer struct {
+	pubKey  string
+	handler InternalPeerHandler
+}
+
 // Server is the WebSocket signaling server for WebRTC connection setup.
 type Server struct {
 	logger      *slog.Logger
 	db          *store.DB // optional, for call logging
 	mu          sync.RWMutex
-	peers       map[string]*Peer // pubkey -> peer
+	peers       map[string]*Peer // pubkey -> peer (WebSocket peers)
+	internalMu  sync.RWMutex
+	internalPeers map[string]*internalPeer // pubkey -> internal peer
 	callMu      sync.Mutex
 	activeCalls map[string]*activeCall // callKey -> activeCall
 	mux         *http.ServeMux
@@ -66,11 +82,12 @@ type Server struct {
 // db is optional — if nil, call logging is disabled.
 func New(addr string, db *store.DB, logger *slog.Logger) *Server {
 	s := &Server{
-		logger:      logger.With("service", "signaling"),
-		db:          db,
-		peers:       make(map[string]*Peer),
-		activeCalls: make(map[string]*activeCall),
-		addr:        addr,
+		logger:        logger.With("service", "signaling"),
+		db:            db,
+		peers:         make(map[string]*Peer),
+		internalPeers: make(map[string]*internalPeer),
+		activeCalls:   make(map[string]*activeCall),
+		addr:          addr,
 	}
 
 	s.mux = http.NewServeMux()
@@ -127,6 +144,38 @@ func (s *Server) PeerCount() int {
 	return len(s.peers)
 }
 
+// IsUserOnline checks if a user (by public key) has an active WebSocket connection.
+func (s *Server) IsUserOnline(pubKey string) bool {
+	s.mu.RLock()
+	_, ok := s.peers[pubKey]
+	s.mu.RUnlock()
+	return ok
+}
+
+// RegisterInternalPeer registers a virtual peer that receives messages via callback.
+// This allows server-side components (like the SIP bridge) to participate in
+// signaling without a WebSocket connection.
+func (s *Server) RegisterInternalPeer(pubKey string, handler InternalPeerHandler) {
+	s.internalMu.Lock()
+	s.internalPeers[pubKey] = &internalPeer{pubKey: pubKey, handler: handler}
+	s.internalMu.Unlock()
+	s.logger.Info("internal peer registered", "pubkey", safeTrunc(pubKey))
+}
+
+// UnregisterInternalPeer removes a virtual peer.
+func (s *Server) UnregisterInternalPeer(pubKey string) {
+	s.internalMu.Lock()
+	delete(s.internalPeers, pubKey)
+	s.internalMu.Unlock()
+	s.logger.Info("internal peer unregistered", "pubkey", safeTrunc(pubKey))
+}
+
+// SendMessage sends a signaling message from an internal peer.
+// This is used by the bridge to send offers/answers/candidates to mobile peers.
+func (s *Server) SendMessage(msg Message) {
+	s.relay(context.Background(), msg)
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"status":"ok","peers":%d}`, s.PeerCount())
@@ -141,7 +190,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(r.Context())
+	// Use Background context — r.Context() gets cancelled after the WebSocket
+	// upgrade completes, which kills the connection immediately.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// First message must be auth
@@ -187,10 +238,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.peers[pubKey] = peer
 	s.mu.Unlock()
 
-	s.logger.Info("peer connected", "pubkey", pubKey[:16])
+	s.logger.Info("peer connected", "pubkey", safeTrunc(pubKey))
 
 	// Send auth OK
-	s.sendMsg(ctx, conn, Message{Type: MsgTypeAuthOK})
+	authOKData, _ := json.Marshal(Message{Type: MsgTypeAuthOK})
+	if err := conn.Write(ctx, websocket.MessageText, authOKData); err != nil {
+		s.logger.Warn("auth_ok write failed", "pubkey", safeTrunc(pubKey), "error", err.Error())
+		return
+	}
 
 	// Read loop
 	defer func() {
@@ -200,12 +255,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			delete(s.peers, pubKey)
 		}
 		s.mu.Unlock()
-		s.logger.Info("peer disconnected", "pubkey", pubKey[:16])
+		s.logger.Info("peer disconnected", "pubkey", safeTrunc(pubKey))
 	}()
 
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
+			s.logger.Info("peer read error", "pubkey", safeTrunc(pubKey), "error", err.Error())
 			return // connection closed
 		}
 
@@ -220,7 +276,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		switch msg.Type {
 		case MsgTypePing:
 			s.sendMsg(ctx, conn, Message{Type: MsgTypePong})
-		case MsgTypeOffer, MsgTypeAnswer, MsgTypeCandidate, MsgTypeHangup:
+		case MsgTypeOffer, MsgTypeAnswer, MsgTypeCandidate, MsgTypeHangup,
+			MsgTypeCallAccept, MsgTypeCallReject, MsgTypeDirectMessage:
 			s.relay(ctx, msg)
 		default:
 			s.sendError(ctx, conn, fmt.Sprintf("unknown message type: %s", msg.Type))
@@ -228,20 +285,18 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// safeTrunc returns at most the first 16 characters of s, or s if shorter.
+func safeTrunc(s string) string {
+	if len(s) > 16 {
+		return s[:16]
+	}
+	return s
+}
+
 // relay forwards a message to the intended recipient.
 func (s *Server) relay(ctx context.Context, msg Message) {
 	if msg.To == "" {
-		s.logger.Warn("relay: missing 'to' field", "from", msg.From[:16], "type", msg.Type)
-		return
-	}
-
-	s.mu.RLock()
-	target, ok := s.peers[msg.To]
-	s.mu.RUnlock()
-
-	if !ok {
-		s.logger.Debug("relay: target not connected", "to", msg.To[:16], "from", msg.From[:16])
-		// TODO: store-and-forward for offline peers
+		s.logger.Warn("relay: missing 'to' field", "from", safeTrunc(msg.From), "type", msg.Type)
 		return
 	}
 
@@ -253,7 +308,27 @@ func (s *Server) relay(ctx context.Context, msg Message) {
 		s.trackCallEnd(msg.From, msg.To)
 	}
 
-	s.sendMsg(ctx, target.Conn, msg)
+	// Try WebSocket peer first
+	s.mu.RLock()
+	target, ok := s.peers[msg.To]
+	s.mu.RUnlock()
+
+	if ok {
+		s.sendMsg(context.Background(), target.Conn, msg)
+		return
+	}
+
+	// Try internal peer (bridge, etc.)
+	s.internalMu.RLock()
+	internal, ok := s.internalPeers[msg.To]
+	s.internalMu.RUnlock()
+
+	if ok {
+		internal.handler(msg)
+		return
+	}
+
+	s.logger.Debug("relay: target not connected", "to", safeTrunc(msg.To), "from", safeTrunc(msg.From))
 }
 
 func (s *Server) sendMsg(ctx context.Context, conn *websocket.Conn, msg Message) {
